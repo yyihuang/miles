@@ -1,4 +1,5 @@
 import copy
+import logging
 import re
 from argparse import Namespace
 from collections import defaultdict
@@ -10,7 +11,9 @@ from pydantic import TypeAdapter
 
 from miles.utils.audit_utils.process_identity import ProcessIdentity
 from miles.utils.env_report.redaction import redact_arg, redact_env_vars, redact_server_info
-from miles.utils.test_utils.snapshot import assert_matches_snapshot, dump_snapshot, snapshot_values
+from miles.utils.test_utils.snapshot import compare_snapshot, dump_snapshot, snapshot_values
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -72,11 +75,18 @@ def check_config_snapshot(*, boundary: str, config: Any) -> None:
         },
         run_uuid=state.run_uuid,
     )
-    actual = dump_snapshot({
-        "normalization": {"run_uuid": "$RUN_UUID", "replacements": replacements},
-        "snapshot": _normalize(value, replacements=replacements),
-    })
-    assert_matches_snapshot(snapshot=state.directory / key, actual=actual, subject=f"runtime configuration {key}")
+    actual = dump_snapshot(
+        {
+            "normalization": {"run_uuid": "$RUN_UUID", "replacements": replacements},
+            "snapshot": _normalize(value, replacements=replacements),
+        }
+    )
+    mismatch = compare_snapshot(snapshot=state.directory / key, actual=actual, subject=f"runtime configuration {key}")
+    if mismatch is None:
+        return
+    if mismatch.recorded is None:
+        raise AssertionError(mismatch.message)
+    logger.error(mismatch.message)
 
 
 def _normalize(value: Any, *, replacements: dict[str, Any]) -> Any:

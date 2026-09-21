@@ -26,6 +26,9 @@ from tests.ci.metric_history.gate import evaluate_gate
 # Env var the training process reads to find the per-attempt record directory; kept
 # in sync with miles.utils.tracking_utils.ci_history.RECORD_DIR_ENV.
 CI_GATE_RECORD_DIR_ENV = "MILES_CI_GATE_RECORD_DIR"
+SNAPSHOT_RECORD_DIR_ENV = "MILES_SNAPSHOT_RECORD_DIR"
+_ATTEMPT_RECORD_DIR_ENVS = (CI_GATE_RECORD_DIR_ENV, SNAPSHOT_RECORD_DIR_ENV)
+_SNAPSHOT_RECORD_TEMP_SUFFIX = ".tmp"
 
 # Accelerator memory is freed by the driver asynchronously after the holders are killed.
 _REAP_SETTLE_SECONDS = 10.0
@@ -45,6 +48,17 @@ def _attempt_record_dir(base_dir: str, filename: str, attempt: int) -> str:
     """Per-test, per-attempt subdir for CI metric-history records."""
     record_key = f"{_sanitize_for_path(filename)}-{hashlib.sha1(filename.encode()).hexdigest()[:10]}"
     return os.path.join(base_dir, record_key, f"attempt-{attempt}")
+
+
+def _recorded_snapshot_mismatches(record_dir: str) -> list[str]:
+    if not os.path.isdir(record_dir):
+        return []
+    return sorted(
+        os.path.relpath(os.path.join(root, name), record_dir)
+        for root, _, names in os.walk(record_dir)
+        for name in names
+        if not name.endswith(_SNAPSHOT_RECORD_TEMP_SUFFIX)
+    )
 
 
 def _merge_attempt_records(attempt_dir: str, merged_path: str) -> None:
@@ -452,6 +466,7 @@ def run_unittest_files(
     passed_tests = []
     failed_tests = []
     retried_tests = []  # Track which tests were retried
+    snapshot_mismatches: list[tuple[str, list[str]]] = []
 
     for i, file in enumerate(files):
         if isinstance(file, CIRegistry):
@@ -465,7 +480,7 @@ def run_unittest_files(
         output_lines = []
         output_tail: deque = deque(maxlen=FAILURE_TAIL_LINES * 8)
 
-        def run_one_file(filename, capture_output=False, record_dir=None, _i=i, _estimated_time=estimated_time):
+        def run_one_file(filename, capture_output=False, record_dirs=None, _i=i, _estimated_time=estimated_time):
             nonlocal process, output_lines, output_tail
             output_tail = deque(maxlen=FAILURE_TAIL_LINES * 8)
 
@@ -473,12 +488,11 @@ def run_unittest_files(
             logger.info(f".\n.\nBegin ({_i}/{len(files) - 1}):\npython3 {full_path}\n.\n.\n")
             file_tic = time.perf_counter()
 
-            child_env = None
-            if record_dir is not None:
+            child_env = os.environ.copy()
+            for env_name, record_dir in (record_dirs or {}).items():
                 # Point the training process at this attempt's own record dir.
                 os.makedirs(record_dir, exist_ok=True)
-                child_env = os.environ.copy()
-                child_env[CI_GATE_RECORD_DIR_ENV] = record_dir
+                child_env[env_name] = record_dir
 
             if capture_output:
                 # Capture output for retry decision
@@ -540,22 +554,34 @@ def run_unittest_files(
             attempt_timeout_after: float | None = None
             attempt_elapsed: float = 0.0
 
-            gate_base_dir = os.environ.get(CI_GATE_RECORD_DIR_ENV)
-            attempt_record_dir = (
-                _attempt_record_dir(gate_base_dir, filename, current_attempt) if gate_base_dir else None
-            )
+            record_dirs = {
+                env_name: _attempt_record_dir(base_dir, filename, current_attempt)
+                for env_name in _ATTEMPT_RECORD_DIR_ENVS
+                if (base_dir := os.environ.get(env_name))
+            }
+            attempt_record_dir = record_dirs.get(CI_GATE_RECORD_DIR_ENV)
+            attempt_snapshot_dir = record_dirs.get(SNAPSHOT_RECORD_DIR_ENV)
 
             try:
                 try:
                     ret_code = run_with_timeout(
                         run_one_file,
                         args=(filename,),
-                        kwargs={"capture_output": enable_retry, "record_dir": attempt_record_dir},
+                        kwargs={"capture_output": enable_retry, "record_dirs": record_dirs},
                         timeout=effective_timeout,
                     )
                     attempt_elapsed = time.perf_counter() - attempt_tic
 
-                    if ret_code == 0:
+                    mismatches = _recorded_snapshot_mismatches(attempt_snapshot_dir) if attempt_snapshot_dir else []
+                    if mismatches:
+                        snapshot_mismatches.append((filename, mismatches))
+                        logger.info(
+                            f"\nSNAPSHOT MISMATCH: {filename} recorded {len(mismatches)} file(s) under {attempt_snapshot_dir}"
+                        )
+                        for mismatch in mismatches:
+                            logger.info(f"  {mismatch}")
+
+                    if ret_code == 0 and not mismatches:
                         attempt_status = "PASS"
                         file_passed = True
                         if attempt_record_dir is not None:
@@ -583,7 +609,7 @@ def run_unittest_files(
                         attempt_status = "FAIL"
                         attempt_exit_code = ret_code
                         # Check if we should retry
-                        if enable_retry and attempt < max_attempts:
+                        if ret_code != 0 and enable_retry and attempt < max_attempts:
                             output = "".join(output_lines)
                             is_retriable, reason = is_retriable_failure(output)
 
@@ -597,10 +623,18 @@ def run_unittest_files(
                                 logger.info(f"\n[CI Retry] {filename} failed with {reason} - not retrying\n")
 
                         # No retry or not retriable
-                        logger.info(f"\nFAILED: {filename} returned exit code {ret_code}\n")
+                        if ret_code != 0:
+                            logger.info(f"\nFAILED: {filename} returned exit code {ret_code}\n")
+                            failed_tests.append((filename, f"exit code {ret_code}", _failure_tail(output_tail)))
+                        else:
+                            logger.info(
+                                f"\nFAILED: {filename} completed but {len(mismatches)} snapshot(s) mismatched\n"
+                            )
+                            failed_tests.append(
+                                (filename, f"{len(mismatches)} snapshot mismatch(es)", "\n".join(mismatches))
+                            )
                         if was_retried:
                             retried_tests.append((filename, attempt, "failed"))
-                        failed_tests.append((filename, f"exit code {ret_code}", _failure_tail(output_tail)))
                         break
 
                 except TimeoutError:
@@ -689,6 +723,12 @@ def run_unittest_files(
         for test, attempts, result in retried_tests:
             logger.info(f"  {test} ({attempts} attempts, {result})")
     logger.info(f"{'='*60}\n")
+
+    if snapshot_mismatches:
+        summary = f"**Snapshot mismatches in {len(snapshot_mismatches)} test(s):**\n"
+        for test, mismatches in snapshot_mismatches:
+            summary += f"- `{test}`\n" + "".join(f"  - `{mismatch}`\n" for mismatch in mismatches)
+        write_github_step_summary(summary)
 
     # Write GitHub Step Summary only if retries occurred
     if retried_tests:

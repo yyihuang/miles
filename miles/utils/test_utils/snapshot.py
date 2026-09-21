@@ -5,8 +5,9 @@ import functools
 import inspect
 import os
 import re
+import uuid
 from collections.abc import Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,17 @@ import yaml
 from pydantic import BaseModel
 
 SNAPSHOT_UPDATE_ENV_VAR = "MILES_UPDATE_SNAPSHOTS"
+SNAPSHOT_RECORD_DIR_ENV_VAR = "MILES_SNAPSHOT_RECORD_DIR"
+SNAPSHOT_RECORD_TEMP_SUFFIX = ".tmp"
+SNAPSHOT_CONFLICT_MARKER = ".conflict-"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+SNAPSHOT_DIR = _REPO_ROOT / "tests" / "snapshots"
+
+
+@dataclass(frozen=True)
+class SnapshotMismatch:
+    message: str
+    recorded: Path | None
 
 
 def dump_snapshot(value: Any) -> str:
@@ -31,10 +43,12 @@ def snapshot_values(value: Any) -> Any:
     if isinstance(value, (argparse._ActionsContainer, argparse.Action)):
         return {"$class": _qualified_name(type(value)), "state": snapshot_values(vars(value))}
     if isinstance(value, BaseModel):
-        return snapshot_values({
-            **{name: value.__getattribute__(name) for name in type(value).model_fields},
-            **(value.model_extra or {}),
-        })
+        return snapshot_values(
+            {
+                **{name: value.__getattribute__(name) for name in type(value).model_fields},
+                **(value.model_extra or {}),
+            }
+        )
     if is_dataclass(value) and not isinstance(value, type):
         return snapshot_values({field.name: value.__getattribute__(field.name) for field in fields(value)})
     if isinstance(value, Mapping):
@@ -92,23 +106,69 @@ def assert_scenario_snapshots(*, snapshots: dict[str, str], bases: dict[str, str
 
 
 def assert_matches_snapshot(snapshot: Path, actual: str, subject: str, *, update: bool | None = None) -> None:
+    if (mismatch := compare_snapshot(snapshot=snapshot, actual=actual, subject=subject, update=update)) is not None:
+        raise AssertionError(mismatch.message)
+
+
+def compare_snapshot(
+    *, snapshot: Path, actual: str, subject: str, update: bool | None = None
+) -> SnapshotMismatch | None:
     if update if update is not None else bool(os.environ.get(SNAPSHOT_UPDATE_ENV_VAR)):
         snapshot.parent.mkdir(parents=True, exist_ok=True)
         snapshot.write_text(actual)
-        return
+        return None
 
     exists = snapshot.exists()
     expected = snapshot.read_text() if exists else ""
-    if not exists or actual != expected:
-        diff = difflib.unified_diff(
+    if exists and actual == expected:
+        return None
+
+    header = f"{subject} does not match its snapshot or baseline is missing: {snapshot}\n"
+    if record_dir := os.environ.get(SNAPSHOT_RECORD_DIR_ENV_VAR):
+        recorded = _record_snapshot_mismatch(record_dir=Path(record_dir), snapshot=snapshot, actual=actual)
+        return SnapshotMismatch(message=f"{header}Recorded the actual content at {recorded}.", recorded=recorded)
+    diff = "\n".join(
+        difflib.unified_diff(
             expected.splitlines(), actual.splitlines(), fromfile=f"{snapshot}", tofile="actual", lineterm=""
         )
-        raise AssertionError(
-            f"{subject} does not match its snapshot or baseline is missing: {snapshot}\n"
-            + "\n".join(diff)
-            + f"\n--- BEGIN ACTUAL {snapshot.name} ---\n{actual}--- END ACTUAL ---\n"
-            + f"Copy the content above to {snapshot}, or regenerate with {SNAPSHOT_UPDATE_ENV_VAR}=1."
-        )
+    )
+    return SnapshotMismatch(
+        message=header
+        + diff
+        + f"\n--- BEGIN ACTUAL {snapshot.name} ---\n{actual}--- END ACTUAL ---\n"
+        + f"Copy the content above to {snapshot}, or regenerate with {SNAPSHOT_UPDATE_ENV_VAR}=1.",
+        recorded=None,
+    )
+
+
+def list_recorded_snapshots(record_dir: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in record_dir.rglob("*")
+        if path.is_file() and not path.name.endswith(SNAPSHOT_RECORD_TEMP_SUFFIX)
+    )
+
+
+def _record_snapshot_mismatch(*, record_dir: Path, snapshot: Path, actual: str) -> Path:
+    resolved = snapshot.resolve()
+    if not resolved.is_relative_to(SNAPSHOT_DIR):
+        raise ValueError(f"Snapshot {snapshot} must live under {SNAPSHOT_DIR} to be recorded")
+    target = record_dir / resolved.relative_to(_REPO_ROOT)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    temp = target.with_name(f".{target.name}.{uuid.uuid4().hex}{SNAPSHOT_RECORD_TEMP_SUFFIX}")
+    temp.write_text(actual)
+    try:
+        try:
+            os.link(temp, target)
+        except FileExistsError:
+            if target.read_text() == actual:
+                return target
+            target = target.with_name(f"{target.name}{SNAPSHOT_CONFLICT_MARKER}{uuid.uuid4().hex}")
+            os.link(temp, target)
+    finally:
+        temp.unlink()
+    return target
 
 
 def _qualified_name(value: Any) -> str:

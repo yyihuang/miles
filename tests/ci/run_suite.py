@@ -15,6 +15,7 @@ from tests.ci.ci_policy import (
 from tests.ci.ci_register import CIRegistry, HWBackend, collect_tests, discover_ci_files
 from tests.ci.ci_utils import (
     CI_GATE_RECORD_DIR_ENV,
+    SNAPSHOT_RECORD_DIR_ENV,
     build_store_from_env,
     gate_provenance_from_env,
     reaping_is_isolated,
@@ -271,6 +272,8 @@ def run_a_suite(args):
     # subprocesses' CiHistoryBackend and the merge/gate steps read it from env.
     if gate_store is not None and hw == HWBackend.CUDA and not os.environ.get(CI_GATE_RECORD_DIR_ENV):
         os.environ[CI_GATE_RECORD_DIR_ENV] = tempfile.mkdtemp(prefix="miles-ci-gate-")
+    if not os.environ.get(SNAPSHOT_RECORD_DIR_ENV):
+        os.environ[SNAPSHOT_RECORD_DIR_ENV] = tempfile.mkdtemp(prefix="miles-snapshot-records-")
 
     return run_unittest_files(
         ci_tests,
