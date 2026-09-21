@@ -21,7 +21,7 @@ def configure_logger(args, *, source: ProcessIdentity, report_env: bool = True) 
     name = source.to_name()
     configure_logger_raw(name)
     configure_config_snapshots(args=args, source=source)
-    check_config_snapshot(boundary="process_config", config=args)
+    check_config_snapshot(boundary="process_config", config={"args": args})
 
     if (event_dir := getattr(args, "save_debug_event_data", None)) is not None:
         if not is_event_logger_initialized():

@@ -85,15 +85,7 @@ def assert_scenario_snapshots(*, snapshots: dict[str, str], bases: dict[str, str
     for name, snapshot in snapshots.items():
         suffix = ".yaml"
         if base := bases.get(name):
-            snapshot = "".join(
-                difflib.unified_diff(
-                    snapshots[base].splitlines(keepends=True),
-                    snapshot.splitlines(keepends=True),
-                    fromfile=base,
-                    tofile=name,
-                    n=0,
-                )
-            )
+            snapshot = snapshot_diff(base_name=base, base=snapshots[base], name=name, actual=snapshot)
             suffix = ".diff"
         try:
             assert_matches_snapshot(
@@ -103,6 +95,14 @@ def assert_scenario_snapshots(*, snapshots: dict[str, str], bases: dict[str, str
             failures.append(str(error))
     if failures:
         raise AssertionError("\n\n".join(failures))
+
+
+def snapshot_diff(*, base_name: str, base: str, name: str, actual: str) -> str:
+    return "".join(
+        difflib.unified_diff(
+            base.splitlines(keepends=True), actual.splitlines(keepends=True), fromfile=base_name, tofile=name, n=0
+        )
+    )
 
 
 def assert_matches_snapshot(snapshot: Path, actual: str, subject: str, *, update: bool | None = None) -> None:

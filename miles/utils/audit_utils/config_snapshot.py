@@ -9,9 +9,9 @@ from typing import Any
 
 from pydantic import TypeAdapter
 
-from miles.utils.audit_utils.process_identity import ProcessIdentity
+from miles.utils.audit_utils.process_identity import ProcessIdentity, TrainProcessIdentity
 from miles.utils.env_report.redaction import redact_arg, redact_env_vars, redact_server_info
-from miles.utils.test_utils.snapshot import compare_snapshot, dump_snapshot, snapshot_values
+from miles.utils.test_utils.snapshot import compare_snapshot, dump_snapshot, snapshot_diff, snapshot_values
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +21,16 @@ class _SnapshotState:
     directory: Path
     run_uuid: str
     source: str
+    rank_within_cell: int | None
     replacements: dict[str, dict[str, Any]]
     counts: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    base_actual: str | None = None
 
 
 _snapshot_state: _SnapshotState | None = None
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+_BASE_BOUNDARY = "process_config"
+_RANK_PLACEHOLDER = "$RANK"
 
 
 def configure_config_snapshots(*, args: Namespace, source: ProcessIdentity) -> None:
@@ -53,7 +57,8 @@ def configure_config_snapshots(*, args: Namespace, source: ProcessIdentity) -> N
     _snapshot_state = _SnapshotState(
         directory=directory / name / args.deploy_component / (args.deploy_instance_id or "default"),
         run_uuid=args.run_uuid,
-        source=source.to_name(),
+        source=_snapshot_source(source),
+        rank_within_cell=source.rank_within_cell if isinstance(source, TrainProcessIdentity) else None,
         replacements=replacements,
     )
 
@@ -65,28 +70,62 @@ def check_config_snapshot(*, boundary: str, config: Any) -> None:
         raise ValueError(f"Invalid snapshot identity: {state.source!r}/{boundary!r}")
 
     sequence = f"{state.source}/{boundary}"
-    key = f"{sequence}-{state.counts[sequence]:04d}.yaml"
+    name = f"{sequence}-{state.counts[sequence]:04d}"
     state.counts[sequence] += 1
-    replacements = state.replacements.get(key, {})
-    value = _replace_run_uuid(
-        {
-            "boundary": boundary,
-            "config": _redact(snapshot_values(config)),
-        },
-        run_uuid=state.run_uuid,
+    replacements = state.replacements.get(name, {})
+    value = _normalize_ranks(
+        _replace_run_uuid(
+            {
+                "boundary": boundary,
+                "config": _redact(snapshot_values(config)),
+            },
+            run_uuid=state.run_uuid,
+        ),
+        rank_within_cell=state.rank_within_cell,
     )
     actual = dump_snapshot(
         {
-            "normalization": {"run_uuid": "$RUN_UUID", "replacements": replacements},
+            "normalization": {"run_uuid": "$RUN_UUID", "rank": _RANK_PLACEHOLDER, "replacements": replacements},
             "snapshot": _normalize(value, replacements=replacements),
         }
     )
-    mismatch = compare_snapshot(snapshot=state.directory / key, actual=actual, subject=f"runtime configuration {key}")
+
+    if state.base_actual is None:
+        if boundary != _BASE_BOUNDARY:
+            raise ValueError(f"The first configuration snapshot must be {_BASE_BOUNDARY!r}, got {boundary!r}")
+        state.base_actual = actual
+        snapshot = state.directory / f"{name}.yaml"
+        content = actual
+    else:
+        snapshot = state.directory / f"{name}.diff"
+        content = snapshot_diff(
+            base_name=f"{state.source}/{_BASE_BOUNDARY}-0000", base=state.base_actual, name=name, actual=actual
+        )
+
+    mismatch = compare_snapshot(snapshot=snapshot, actual=content, subject=f"runtime configuration {name}")
     if mismatch is None:
         return
     if mismatch.recorded is None:
         raise AssertionError(mismatch.message)
     logger.error(mismatch.message)
+
+
+def _snapshot_source(source: ProcessIdentity) -> str:
+    return source.to_cell_name() if isinstance(source, TrainProcessIdentity) else source.to_name()
+
+
+def _normalize_ranks(value: dict[str, Any], *, rank_within_cell: int | None) -> dict[str, Any]:
+    config = value["config"]
+    if "rank" in config:
+        assert (
+            config["rank"] == rank_within_cell
+        ), f"snapshot rank {config['rank']!r} differs from {rank_within_cell!r}"
+        config["rank"] = _RANK_PLACEHOLDER
+    args = config["args"]
+    if "rank" in args:
+        assert isinstance(args["rank"], int) and args["rank"] >= 0, f"unexpected args.rank {args['rank']!r}"
+        args["rank"] = _RANK_PLACEHOLDER
+    return value
 
 
 def _normalize(value: Any, *, replacements: dict[str, Any]) -> Any:
