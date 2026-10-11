@@ -48,7 +48,12 @@ from miles_plugins.models.deepseek_v4.ops.thd_utils import (
     to_rank_major_rows,
 )
 from miles_plugins.models.deepseek_v4.ops.v4_indexer import V4Indexer
-from miles_plugins.models.dsa_backend import check_loom_topk_backend, loom_dsa_ops, resolve_dsa_attention_backend
+from miles_plugins.models.dsa_backend import (
+    check_loom_topk_backend,
+    loom_dsa_ops,
+    loom_topk_key_bound,
+    resolve_dsa_attention_backend,
+)
 
 
 def _enable_deepseek_v4_tf32():
@@ -466,8 +471,14 @@ def get_dsv4_spec(args, config, vp_stage):
         return get_transformer_block_with_experimental_attention_variant_spec(config, vp_stage=vp_stage)
 
     config.miles_dsa_topk_backend = args.miles_dsa_topk_backend
+    # The V4 indexer scores the compress-ratio-4 keys of the whole stream (``V4Indexer.compress_ratio = 4``):
+    # at most ceil(seq_length / 4) rows per packed sequence; THD packing can add one key per packed sequence
+    # beyond this estimate, which the per-call check in ``dsa_train.loom_topk`` still catches.
     check_loom_topk_backend(
-        args.miles_dsa_topk_backend, getattr(config, "dsa_indexer_topk", None), model="DeepSeek-V4"
+        args.miles_dsa_topk_backend,
+        getattr(config, "dsa_indexer_topk", None),
+        model="DeepSeek-V4",
+        max_keys=loom_topk_key_bound(getattr(args, "seq_length", None), (4,)),
     )
     config.dsa_attention_backend = resolve_dsa_attention_backend(getattr(args, "dsa_attention_backend", None))
     _orig_get_spec = _eav_specs.get_experimental_attention_variant_module_spec
