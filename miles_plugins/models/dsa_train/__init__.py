@@ -14,6 +14,8 @@ partials in an order fixed by the indices, so repeated passes on identical input
 Public surface (see :mod:`.ops`): :func:`sparse_attention`, :func:`lightning_indexer`,
 :func:`indexer_logits`, :func:`select_topk`, :func:`indexer_topk_scores`, plus the non-autograd
 :func:`sparse_attention_forward` / :func:`sparse_attention_backward` / :func:`indexer_backward`.
+The top-k backends are :func:`torch_topk`, :func:`flashinfer_topk` and the generated deterministic
+:func:`loom_topk` (``--miles-dsa-topk-backend loom``; FP32 rows of at most 32768 keys, ``topk <= 512``).
 """
 
 from ._jit import SUPPORTED_CAPABILITIES, device_arch
@@ -25,6 +27,7 @@ from .ops import (
     indexer_logits,
     indexer_topk_scores,
     lightning_indexer,
+    loom_topk,
     register_topk_backend,
     select_topk,
     sparse_attention,
@@ -43,6 +46,7 @@ __all__ = [
     "indexer_logits",
     "indexer_topk_scores",
     "lightning_indexer",
+    "loom_topk",
     "register_topk_backend",
     "select_topk",
     "sparse_attention",

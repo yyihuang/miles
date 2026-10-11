@@ -12,7 +12,8 @@ Public surface (all layouts of :mod:`.layouts`):
   ``deepseek_v4...tilelang_sparse_mla.sparse_attn_tilelang``.
 * :func:`indexer_logits`, :func:`select_topk`, :func:`indexer_topk_scores`,
   :func:`lightning_indexer` -- the indexer pipeline with a replaceable top-k
-  backend and an explicit ``topk_indices`` override for rollout replay; replaces
+  backend (``torch``, ``flashinfer``, or ``loom`` = the generated deterministic
+  :func:`loom_topk`) and an explicit ``topk_indices`` override for rollout replay; replaces
   ``glm5.ops.indexer.lighting_indexer`` / ``IndexerFunction`` and
   ``deepseek_v4...tilelang_indexer.V4IndexerFunction``.
 * :func:`sparse_attention_forward` / :func:`sparse_attention_backward` /
@@ -63,7 +64,24 @@ def flashinfer_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
     return indices.reshape(*orig_shape[:-1], topk) if logits.dim() > 2 else indices
 
 
-_TOPK_BACKENDS: dict[str, TopkFn] = {"torch": torch_topk, "flashinfer": flashinfer_topk}
+def loom_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
+    """The generated deterministic FP32 row top-k (``dsa_topk_fp32``) with the same ``-1`` convention.
+
+    ``logits`` is FP32 ``[rows, num_keys]`` with ``num_keys <= 32768`` and ``topk <= 512`` (SM100a /
+    SM103a); ``-inf`` and NaN positions are never selected.  Output layout contract: slot ``j`` of a
+    row holds the key with the ``j``-th highest score (ties: the smaller index first) and the unfilled
+    tail is ``-1`` (also when a row has fewer than ``topk`` finite scores).  This differs from the
+    ascending-index layout (``-1`` first) of the ``torch.topk`` + ``.sort`` paths; every consumer
+    gathers by slot and is position-independent, so callers use the output directly and must not
+    re-sort it.  Bit-identical run to run (no floating-point atomics).  Limits are enforced with a
+    ``ValueError``; there is no silent fallback to another backend.
+    """
+    from . import _kernels as weave
+
+    return weave.dsa_topk(logits, topk)
+
+
+_TOPK_BACKENDS: dict[str, TopkFn] = {"torch": torch_topk, "flashinfer": flashinfer_topk, "loom": loom_topk}
 
 
 def register_topk_backend(name: str, fn: TopkFn) -> None:
