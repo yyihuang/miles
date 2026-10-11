@@ -15,13 +15,16 @@ Public surface (see :mod:`.ops`): :func:`sparse_attention`, :func:`lightning_ind
 :func:`indexer_logits`, :func:`select_topk`, :func:`indexer_topk_scores`, plus the non-autograd
 :func:`sparse_attention_forward` / :func:`sparse_attention_backward` / :func:`indexer_backward`.
 The top-k backends are :func:`torch_topk`, :func:`flashinfer_topk` and the generated deterministic
-:func:`loom_topk` (``--miles-dsa-topk-backend loom``; FP32 rows of at most 32768 keys, ``topk <= 512``).
+:func:`loom_topk` (``--miles-dsa-topk-backend loom``; FP32 rows of at most 32768 keys, ``topk <= 512``);
+``lightning_indexer(..., topk_backend="loom_fused")`` runs the generated fused scoring + top-k stages
+(:func:`fused_indexer_topk_scores`; ``thd``, 32 indexer heads, ``topk <= 512``) without dense logits.
 """
 
 from ._jit import SUPPORTED_CAPABILITIES, device_arch
 from .ops import (
     extract_topk_scores,
     flashinfer_topk,
+    fused_indexer_topk_scores,
     get_topk_fn,
     indexer_backward,
     indexer_logits,
@@ -41,6 +44,7 @@ __all__ = [
     "device_arch",
     "extract_topk_scores",
     "flashinfer_topk",
+    "fused_indexer_topk_scores",
     "get_topk_fn",
     "indexer_backward",
     "indexer_logits",
