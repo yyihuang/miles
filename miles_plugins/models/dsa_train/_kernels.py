@@ -24,16 +24,35 @@ LOG2E = 1.4426950408889634
 INDEXER_HEAD_DIM = 128
 INDEXER_HEADS = (8, 16, 32, 64)
 ATTENTION_SHAPES = ((512, 64), (512, 0))  # (d_v, d_tail)
+TOPK_STAGE_PREFIX = "dsa_topk_fp32_"
 
-_PREBUILT: set[str] = set()
+# (arch, family) pairs whose stages were prebuilt (or deliberately left lazy) in this process.
+_PREBUILT: set[tuple[str, str]] = set()
+
+
+def _is_topk_stage(name: str) -> bool:
+    return name.startswith(TOPK_STAGE_PREFIX)
+
+
+def _family_stages(family: str) -> tuple[str, ...]:
+    """The registry stages one family prebuilds: ``"topk"`` = the ``dsa_topk_fp32_*`` capacity variants,
+    ``"attention"`` = everything else (sparse attention, indexer logits / backward, clean, segmented reduce)."""
+    return tuple(stage for stage in MODULES if _is_topk_stage(stage) == (family == "topk"))
 
 
 def _kernel(name: str, device):
+    """The native kernel for stage ``name`` on ``device``'s architecture.
+
+    The first use of a stage family on an architecture prebuilds that family's stages in parallel (about a
+    minute per stage), so the attention / indexer operators never compile the top-k variants and the top-k
+    backend never compiles the attention kernels; ``MILES_DSA_TRAIN_PREBUILD=0`` builds each stage lazily.
+    """
     arch = device_arch(device)
-    if arch not in _PREBUILT:
-        _PREBUILT.add(arch)
+    family = "topk" if _is_topk_stage(name) else "attention"
+    if (arch, family) not in _PREBUILT:
+        _PREBUILT.add((arch, family))
         if os.environ.get("MILES_DSA_TRAIN_PREBUILD", "1") != "0":
-            prebuild(arch)
+            prebuild(arch, stages=_family_stages(family))
     return kernel(name, arch)
 
 
@@ -267,7 +286,7 @@ _TOPK_NO_ROW_END: dict = {}
 
 
 def _topk_name(capacity: int) -> str:
-    return f"dsa_topk_fp32_c{capacity}_k{TOPK_K}"
+    return f"{TOPK_STAGE_PREFIX}c{capacity}_k{TOPK_K}"
 
 
 def topk_capacity(num_keys: int) -> int:
