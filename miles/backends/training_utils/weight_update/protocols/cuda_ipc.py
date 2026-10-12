@@ -51,6 +51,10 @@ def _persistent_ipc_view(flat: torch.Tensor) -> torch.Tensor:
         logger.info(f"persistent CUDA-IPC bucket buffer: {cap * flat.element_size() / 2**20:.0f} MiB {flat.dtype} on {flat.device}")
     view = buf[: flat.numel()]
     view.copy_(flat)
+    # The engine re-opens the SAME CUDA-IPC handle for every bucket. torch's consumer side serves repeat opens from its
+    # storage cache and only waits on the producer's IPC event at the first open, so the copy above must be complete before
+    # the handle is sent; otherwise the engine reads the previous bucket's bytes (observed as a corrupted engine).
+    torch.cuda.current_stream(flat.device).synchronize()
     return view
 
 
