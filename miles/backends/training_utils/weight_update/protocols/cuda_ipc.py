@@ -187,6 +187,15 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
                 futures = (futures or []) + futures_distributed
         check_weight_sync_results(async_utils.wait_futures(futures or []), is_lora=False)
         del long_lived_tensors
+        _n = getattr(self, "_dsv41_ipc_n", 0) + 1
+        self._dsv41_ipc_n = _n
+        _ev = getattr(self, "_dsv41_ipc_ev", None)
+        if _ev is None:
+            import os as _os
+            _ev = int(_os.environ.get("DSV41_IPC_COLLECT_EVERY", "0") or "0")
+            self._dsv41_ipc_ev = _ev
+        if _ev and _n % _ev == 0:
+            torch.cuda.ipc_collect()
 
     def after_engines_resumed(self) -> None:
         torch.cuda.ipc_collect()
