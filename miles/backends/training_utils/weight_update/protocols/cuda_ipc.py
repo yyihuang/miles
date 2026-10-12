@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from argparse import Namespace
 from collections.abc import Sequence
 from concurrent.futures import Future
@@ -29,6 +30,29 @@ from .broadcast import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Run-only (T4 e2e re-validation): with DSV41_IPC_PERSISTENT_BUFFER=1 every flattened bucket is copied into one long-lived
+# buffer per (dtype, device) and that view is shared, so all buckets reuse the same CUDA-IPC block. The producer's memory then no
+# longer depends on how promptly the engine releases its CUDA-IPC references (torch's CudaIPCSentData limbo). The engine side
+# must finish its copies before replying (dsv41_engine_gc_snippet_v2: torch.cuda.synchronize() per bucket) because the next bucket
+# overwrites the buffer after the reply. Default off: upstream behaviour unchanged.
+_IPC_PERSISTENT = os.environ.get("DSV41_IPC_PERSISTENT_BUFFER", "0") == "1"
+_IPC_PERSISTENT_BYTES = int(os.environ.get("DSV41_IPC_PERSISTENT_BUFFER_BYTES", "0") or "0")
+_PERSISTENT_IPC_BUFFERS: dict = {}
+
+
+def _persistent_ipc_view(flat: torch.Tensor) -> torch.Tensor:
+    key = (flat.dtype, flat.device)
+    buf = _PERSISTENT_IPC_BUFFERS.get(key)
+    if buf is None or buf.numel() < flat.numel():
+        cap = max(flat.numel(), _IPC_PERSISTENT_BYTES // max(flat.element_size(), 1))
+        buf = torch.empty(cap, dtype=flat.dtype, device=flat.device)
+        _PERSISTENT_IPC_BUFFERS[key] = buf
+        logger.info(f"persistent CUDA-IPC bucket buffer: {cap * flat.element_size() / 2**20:.0f} MiB {flat.dtype} on {flat.device}")
+    view = buf[: flat.numel()]
+    view.copy_(flat)
+    return view
+
 
 
 class UpdateWeightFromTensor(WeightTransferProtocol):
@@ -231,8 +255,11 @@ def _send_to_colocated_engine(
     serialized_tensors: list = []
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
         flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
+        if _IPC_PERSISTENT:
+            flattened_tensor = _persistent_ipc_view(flattened_tensor)
         flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+            "flattened_tensor": flattened_tensor,
             "metadata": flattened_tensor_bucket.get_metadata(),
         }
         long_live_tensors.append(flattened_tensor_data)
